@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.components.climate.const import (
@@ -32,6 +33,8 @@ from .const import DOMAIN, MANUFACTURER, DEFAULT_NAME
 from .dispatcher import SIGNAL_DEVICE_UPDATED
 from .service_registry import (
     THERMOSTAT_SERVICE,
+    TEMPERATURE_SERVICE,
+    POWER_USAGE_SERVICE,
     get_device_services,
     make_unique_id,
     get_service_mapping,
@@ -39,6 +42,14 @@ from .service_registry import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# thermostat.v1 exposes no explicit compressor/running flag. Activity is
+# inferred from the live instantaneous power draw published by the device's
+# sibling power.usage service: a running compressor draws far more than the
+# fan alone (fan-only on a window AC is roughly 30-70 W, the compressor adds
+# several hundred watts). Draw above this threshold is treated as "the
+# compressor is actively running".
+_COMPRESSOR_POWER_THRESHOLD_W = 120.0
 
 # ---------------------------------------------------------------------------
 # SmartHQ → HA HVAC mode mapping
@@ -240,9 +251,98 @@ class SmartHQThermostatClimate(ClimateEntity):
         return _THERMOSTAT_MODE_MAP.get(mode_token, HVACMode.OFF)
 
     @property
-    def current_temperature(self) -> float | None:
-        # thermostat.v1 doesn't expose a measured temperature field in state
+    def hvac_action(self) -> HVACAction | None:
+        """Current activity of the unit (cooling / heating / drying / idle).
+
+        thermostat.v1 has no explicit compressor/running field, so the actual
+        activity is inferred: the unit is off when powered off or in the OFF
+        mode, purely moving air in FAN_ONLY, and otherwise actively
+        conditioning only while the compressor is drawing power (see
+        _compressor_running).
+        """
+        st = self._get_state()
+        if st.get("on", True) is False:
+            return HVACAction.OFF
+        mode = self.hvac_mode
+        if mode == HVACMode.OFF:
+            return HVACAction.OFF
+        if mode == HVACMode.FAN_ONLY:
+            return HVACAction.FAN
+
+        running = self._compressor_running()
+        if mode == HVACMode.HEAT:
+            return HVACAction.HEATING if running else HVACAction.IDLE
+        if mode == HVACMode.DRY:
+            return HVACAction.DRYING if running else HVACAction.IDLE
+        # COOL and AUTO both cool.
+        return HVACAction.COOLING if running else HVACAction.IDLE
+
+    def _instantaneous_power(self) -> float | None:
+        """Live power draw (W) from the sibling power.usage service, if any."""
+        snap = _store(self.hass, self._entry).get(self._device_id) or {}
+        services = (snap.get("snapshot") or {}).get("services") or {}
+        for svc in services.values():
+            if (svc.get("serviceType") or "") != POWER_USAGE_SERVICE:
+                continue
+            raw = svc.get("instantaneousPower")
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
         return None
+
+    def _compressor_running(self) -> bool:
+        """Best-effort guess of whether the compressor is actively running.
+
+        Primary signal is the live instantaneous power draw. When no power
+        reading is available, fall back to comparing the ambient temperature
+        against the active setpoint.
+        """
+        power = self._instantaneous_power()
+        if power is not None:
+            return power > _COMPRESSOR_POWER_THRESHOLD_W
+
+        current = self.current_temperature
+        target = self.target_temperature
+        if current is None or target is None:
+            # Unit is on and set to condition but we can't tell — assume active.
+            return True
+        if self.hvac_mode == HVACMode.HEAT:
+            return current < target
+        return current > target
+
+    @property
+    def current_temperature(self) -> float | None:
+        # thermostat.v1 doesn't expose a measured temperature field, but the
+        # same device typically publishes a sibling `service.temperature`
+        # service with a `fahrenheit` reading (the "Ambient Temperature"
+        # sensor). Pull from there so Apple Home / the HA thermostat card show
+        # the actual room temp instead of "unknown".
+        snap = _store(self.hass, self._entry).get(self._device_id) or {}
+        services = (snap.get("snapshot") or {}).get("services") or {}
+        preferred: float | None = None
+        fallback: float | None = None
+        for sid, svc in services.items():
+            if sid == self._service_id:
+                continue
+            if (svc.get("serviceType") or "") != TEMPERATURE_SERVICE:
+                continue
+            raw = svc.get("fahrenheit")
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            dom = (svc.get("domainType") or "").lower()
+            if "measurement" in dom or "ambient" in dom:
+                preferred = val
+                break
+            if fallback is None:
+                fallback = val
+        return preferred if preferred is not None else fallback
 
     @property
     def target_temperature(self) -> float | None:
