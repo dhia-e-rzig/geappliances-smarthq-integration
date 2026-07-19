@@ -15,6 +15,21 @@ This integration uses **OAuth2 Application Credentials** with Authorization Code
 
 ---
 
+## Current Limitations
+
+This integration is built exclusively on the **SmartHQ v2 public developer API**. The SmartHQ mobile app communicates over GE's internal v1 API, which exposes capabilities not available through the public v2 path. As a result, some product lines have limited or no support in Home Assistant even when the app shows full control:
+
+| Product Line | Status | Notes |
+|---|---|---|
+| **Oven / Wall Oven / Range** | ⚠️ Limited | Only basic toggles (Sabbath, Control Lock) and notification settings are available. Cooking features (cavity temperature, cooking mode, cook time, remote start) are served via the app's internal API and are not yet exposed through the v2 public API. The App & Cloud team is actively working to expand oven support. |
+| **Advantium (Speed Cook Oven)** | ❌ Not supported | The Advantium device has no appliance-specific services registered in the v2 API. Only common services (firmware, RSSI, etc.) may appear. |
+| **Fisher & Paykel / Haier appliances** | ⚠️ Limited / ❌ Not supported | These brands use the same SmartHQ Cloud and mobile app as GE Appliances, but appear not to be fully migrated to the SmartHQ v2 public developer API yet. Depending on the model, this can mean missing readings (e.g., current temperature) or no device-specific services being exposed at all. |
+| **Electric / Gas / Induction Cooktops** | ⚠️ Limited | Active cooktop control features may not be exposed through the v2 API. Basic status and settings entities may appear. |
+
+> If your appliance connects successfully but shows fewer entities than expected, the most likely cause is that the cooking or control services for your specific model are not yet exposed through the v2 public developer API — not a bug in the integration.
+
+---
+
 ## How It Works — Service-Based Entity Discovery
 
 This integration is built on the **SmartHQ Developer Portal Cloud API**, which exposes each appliance's capabilities as a list of **Services**. Every SmartHQ device commissioning declares which services it supports (e.g. `cooking.mode.v1`, `laundry.state.v1`, `toggle`, `meter`, etc.).
@@ -55,7 +70,18 @@ This means **no hardcoded device support is needed** — any appliance commissio
 
 ## Installation
 
-### 1. Install the Integration
+### Option A: Install via HACS (Recommended)
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=geappliances&repository=geappliances-smarthq-integration&category=integration)
+
+1. Click the button above — your Home Assistant will open the HACS custom repository dialog automatically
+2. Click **"Download"** to install the integration
+3. Restart Home Assistant
+
+> **Don't have HACS?** Install it from [hacs.xyz](https://hacs.xyz/docs/use/download/download/) first, then return here.
+
+### Option B: Manual Installation
+
 Copy this folder to your Home Assistant configuration directory:
 ```bash
 /config/custom_components/smarthq
@@ -76,7 +102,8 @@ Before adding the integration, you need to obtain OAuth2 credentials from SmartH
 <img width="944" height="585" alt="image" src="https://github.com/user-attachments/assets/65e43b22-27cc-499d-bab4-097d6e0d70cb" />
 
 #### Step 2: Configure Your App
-1. Enter a **Machine name** (e.g., "homeassistant")
+1. Enter a **unique Machine name** (e.g., `homeassistant-yourname` or `ha-<something-unique>`)
+   > ⚠️ **Do NOT use the plain name `homeassistant`.** The Machine name must be globally unique on the SmartHQ Developer Portal. A name that is already taken (such as `homeassistant`) causes the OAuth login to fail with an `OAuth2.0 Error` / `User session expired` message. Pick your own unique name.
 2. Set **Callback URL** to: `https://my.home-assistant.io/redirect/oauth`
 3. Click **"ADD APP"**
 4. Copy your **Client ID** and **Client Secret** (you'll need these)
@@ -236,6 +263,14 @@ logger:
 ---
 
 ## Troubleshooting
+
+### "OAuth2.0 Error" / "User session expired. Please start over"
+This error usually comes from the SmartHQ (GE) OAuth server, not from Home Assistant. Check the following in order:
+1. **Use a unique app Machine name.** Do **not** name your app `homeassistant` on the [SmartHQ Developer Portal](https://developer.smarthq.com). A duplicate/reserved name causes this exact error. Delete the app and recreate it with a unique name (e.g., `homeassistant-yourname`), then create new Application Credentials in HA with a unique name too.
+2. **Verify the Callback URL** in the Developer Portal is exactly `https://my.home-assistant.io/redirect/oauth` (note the trailing `/oauth`).
+3. **Complete the login quickly.** The GE OAuth session has a short timeout — click the login link immediately and finish without leaving the tab open.
+4. If the GE page still says `User session expired`, clear cookies for `accounts.brillion.geappliances.com` (or use a private/incognito window) and click the link again to start a fresh session.
+5. Confirm you can sign in directly at [accounts.brillion.geappliances.com](https://accounts.brillion.geappliances.com/) with the same account.
 
 ### "Failed to authenticate"
 - Verify your Client ID and Client Secret are correct in Application Credentials

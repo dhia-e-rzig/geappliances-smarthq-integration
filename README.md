@@ -15,6 +15,21 @@ This integration uses **OAuth2 Application Credentials** with Authorization Code
 
 ---
 
+## Current Limitations
+
+This integration is built exclusively on the **SmartHQ v2 public developer API**. The SmartHQ mobile app communicates over GE's internal v1 API, which exposes capabilities not available through the public v2 path. As a result, some product lines have limited or no support in Home Assistant even when the app shows full control:
+
+| Product Line | Status | Notes |
+|---|---|---|
+| **Oven / Wall Oven / Range** | ⚠️ Limited | Only basic toggles (Sabbath, Control Lock) and notification settings are available. Cooking features (cavity temperature, cooking mode, cook time, remote start) are served via the app's internal API and are not yet exposed through the v2 public API. The App & Cloud team is actively working to expand oven support. |
+| **Advantium (Speed Cook Oven)** | ❌ Not supported | The Advantium device has no appliance-specific services registered in the v2 API. Only common services (firmware, RSSI, etc.) may appear. |
+| **Fisher & Paykel / Haier appliances** | ⚠️ Limited / ❌ Not supported | These brands use the same SmartHQ Cloud and mobile app as GE Appliances, but appear not to be fully migrated to the SmartHQ v2 public developer API yet. Depending on the model, this can mean missing readings (e.g., current temperature) or no device-specific services being exposed at all. |
+| **Electric / Gas / Induction Cooktops** | ⚠️ Limited | Active cooktop control features may not be exposed through the v2 API. Basic status and settings entities may appear. |
+
+> If your appliance connects successfully but shows fewer entities than expected, the most likely cause is that the cooking or control services for your specific model are not yet exposed through the v2 public developer API — not a bug in the integration.
+
+---
+
 ## How It Works — Service-Based Entity Discovery
 
 This integration is built on the **SmartHQ Developer Portal Cloud API**, which exposes each appliance's capabilities as a list of **Services**. Every SmartHQ device commissioning declares which services it supports (e.g. `cooking.mode.v1`, `laundry.state.v1`, `toggle`, `meter`, etc.).

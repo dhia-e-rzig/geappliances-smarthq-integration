@@ -32,9 +32,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, MANUFACTURER, DEFAULT_NAME
 from .dispatcher import SIGNAL_DEVICE_UPDATED
 from .service_registry import (
+    POWER_USAGE_SERVICE,
     THERMOSTAT_SERVICE,
     TEMPERATURE_SERVICE,
-    POWER_USAGE_SERVICE,
     get_device_services,
     make_unique_id,
     get_service_mapping,
@@ -43,24 +43,20 @@ from .service_registry import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# thermostat.v1 exposes no explicit compressor/running flag. Activity is
-# inferred from the live instantaneous power draw published by the device's
-# sibling power.usage service: a running compressor draws far more than the
-# fan alone (fan-only on a window AC is roughly 30-70 W, the compressor adds
-# several hundred watts). Draw above this threshold is treated as "the
-# compressor is actively running".
 _COMPRESSOR_POWER_THRESHOLD_W = 120.0
+_ENERGY_SAVER_MODE = "cloud.smarthq.type.thermostatmode.cool.energysaver"
+_NATIVE_AUTO_MODE = "cloud.smarthq.type.thermostatmode.auto"
 
 # ---------------------------------------------------------------------------
 # SmartHQ → HA HVAC mode mapping
 # ---------------------------------------------------------------------------
 _THERMOSTAT_MODE_MAP: Dict[str, HVACMode] = {
     "cloud.smarthq.type.thermostatmode.cool":              HVACMode.COOL,
-    "cloud.smarthq.type.thermostatmode.cool.energysaver":  HVACMode.COOL,
+    _ENERGY_SAVER_MODE:                                    HVACMode.AUTO,
     "cloud.smarthq.type.thermostatmode.cool.quiet":        HVACMode.COOL,
     "cloud.smarthq.type.thermostatmode.cool.turbo":        HVACMode.COOL,
     "cloud.smarthq.type.thermostatmode.heat":              HVACMode.HEAT,
-    "cloud.smarthq.type.thermostatmode.auto":              HVACMode.AUTO,
+    _NATIVE_AUTO_MODE:                                     HVACMode.AUTO,
     "cloud.smarthq.type.thermostatmode.auto.twotemperature": HVACMode.AUTO,
     "cloud.smarthq.type.thermostatmode.dry":               HVACMode.DRY,
     "cloud.smarthq.type.thermostatmode.fanonly":           HVACMode.FAN_ONLY,
@@ -73,7 +69,7 @@ _THERMOSTAT_MODE_MAP: Dict[str, HVACMode] = {
 _HA_MODE_TO_SMARTHQ: Dict[HVACMode, str] = {
     HVACMode.COOL:     "cloud.smarthq.type.thermostatmode.cool",
     HVACMode.HEAT:     "cloud.smarthq.type.thermostatmode.heat",
-    HVACMode.AUTO:     "cloud.smarthq.type.thermostatmode.auto",
+    HVACMode.AUTO:     _NATIVE_AUTO_MODE,
     HVACMode.DRY:      "cloud.smarthq.type.thermostatmode.dry",
     HVACMode.FAN_ONLY: "cloud.smarthq.type.thermostatmode.fanonly",
     HVACMode.OFF:      "cloud.smarthq.type.thermostatmode.off",
@@ -210,9 +206,9 @@ class SmartHQThermostatClimate(ClimateEntity):
         self._attr_unique_id = unique_id
 
         # Build supported HVAC modes from config
-        supported_modes_tokens = svc_config.get("supportedModes") or []
+        self._supported_mode_tokens = set(svc_config.get("supportedModes") or [])
         hvac_modes = {HVACMode.OFF}
-        for token in supported_modes_tokens:
+        for token in self._supported_mode_tokens:
             ha_mode = _THERMOSTAT_MODE_MAP.get(token)
             if ha_mode:
                 hvac_modes.add(ha_mode)
@@ -252,17 +248,11 @@ class SmartHQThermostatClimate(ClimateEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        """Current activity of the unit (cooling / heating / drying / idle).
-
-        thermostat.v1 has no explicit compressor/running field, so the actual
-        activity is inferred: the unit is off when powered off or in the OFF
-        mode, purely moving air in FAN_ONLY, and otherwise actively
-        conditioning only while the compressor is drawing power (see
-        _compressor_running).
-        """
+        """Return the unit's current activity."""
         st = self._get_state()
         if st.get("on", True) is False:
             return HVACAction.OFF
+
         mode = self.hvac_mode
         if mode == HVACMode.OFF:
             return HVACAction.OFF
@@ -274,11 +264,10 @@ class SmartHQThermostatClimate(ClimateEntity):
             return HVACAction.HEATING if running else HVACAction.IDLE
         if mode == HVACMode.DRY:
             return HVACAction.DRYING if running else HVACAction.IDLE
-        # COOL and AUTO both cool.
         return HVACAction.COOLING if running else HVACAction.IDLE
 
     def _instantaneous_power(self) -> float | None:
-        """Live power draw (W) from the sibling power.usage service, if any."""
+        """Return live power draw from the sibling power service."""
         snap = _store(self.hass, self._entry).get(self._device_id) or {}
         services = (snap.get("snapshot") or {}).get("services") or {}
         for svc in services.values():
@@ -294,12 +283,7 @@ class SmartHQThermostatClimate(ClimateEntity):
         return None
 
     def _compressor_running(self) -> bool:
-        """Best-effort guess of whether the compressor is actively running.
-
-        Primary signal is the live instantaneous power draw. When no power
-        reading is available, fall back to comparing the ambient temperature
-        against the active setpoint.
-        """
+        """Infer compressor activity from power or current temperature."""
         power = self._instantaneous_power()
         if power is not None:
             return power > _COMPRESSOR_POWER_THRESHOLD_W
@@ -307,7 +291,6 @@ class SmartHQThermostatClimate(ClimateEntity):
         current = self.current_temperature
         target = self.target_temperature
         if current is None or target is None:
-            # Unit is on and set to condition but we can't tell — assume active.
             return True
         if self.hvac_mode == HVACMode.HEAT:
             return current < target
@@ -317,9 +300,9 @@ class SmartHQThermostatClimate(ClimateEntity):
     def current_temperature(self) -> float | None:
         # thermostat.v1 doesn't expose a measured temperature field, but the
         # same device typically publishes a sibling `service.temperature`
-        # service with a `fahrenheit` reading (the "Ambient Temperature"
-        # sensor). Pull from there so Apple Home / the HA thermostat card show
-        # the actual room temp instead of "unknown".
+        # service with a `fahrenheit` reading (surfaced as the "Ambient
+        # Temperature (°F)" sensor). Pull from there so Apple Home / the HA
+        # thermostat card show the actual room temp instead of "unknown".
         snap = _store(self.hass, self._entry).get(self._device_id) or {}
         services = (snap.get("snapshot") or {}).get("services") or {}
         preferred: float | None = None
@@ -383,6 +366,12 @@ class SmartHQThermostatClimate(ClimateEntity):
             await client.async_set_thermostat(self._device_id, self._service_id, on=False)
         else:
             smarthq_mode = _HA_MODE_TO_SMARTHQ.get(hvac_mode)
+            if (
+                hvac_mode == HVACMode.AUTO
+                and _ENERGY_SAVER_MODE in self._supported_mode_tokens
+                and _NATIVE_AUTO_MODE not in self._supported_mode_tokens
+            ):
+                smarthq_mode = _ENERGY_SAVER_MODE
             if smarthq_mode:
                 await client.async_set_thermostat(
                     self._device_id, self._service_id,
